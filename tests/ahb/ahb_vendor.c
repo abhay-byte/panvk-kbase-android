@@ -34,9 +34,14 @@ main(int argc, char **argv)
       printf("FAIL dlopen %s\n", dlerror());
       return 1;
    }
-   icd_gipa_fn gipa = (icd_gipa_fn)dlsym(h, "vk_icdGetInstanceProcAddr");
+   /* system loader path: vkGetInstanceProcAddr has the same
+    * (instance,name) shape as vk_icdGetInstanceProcAddr, so the G()/G0()
+    * macros work unchanged for the vendor stack too */
+   icd_gipa_fn gipa = (icd_gipa_fn)dlsym(h, "vkGetInstanceProcAddr");
+   if (!gipa)
+      gipa = (icd_gipa_fn)dlsym(h, "vk_icdGetInstanceProcAddr");
    if (!gipa) {
-      printf("FAIL gipa\n");
+      printf("FAIL gpa\n");
       return 1;
    }
 #define G0(what, name)                                                      \
