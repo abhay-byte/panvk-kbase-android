@@ -1,4 +1,4 @@
-/* Gate G: real AHardwareBuffer allocate -> query properties -> import -> bind -> GPU render -> CPU readback via AHB lock -> release cleanly */
+/* Gate G: real AHardwareBuffer allocate -> import -> bind -> GPU render triangle -> CPU readback via AHB lock. */
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <dlfcn.h>
 #include <stdio.h>
@@ -178,13 +178,13 @@ int main(int argc, char **argv)
    VkQueue queue;
    vkGetDeviceQueue(dev, qi, 0, &queue);
 
-   /* 1. Allocate real AHB */
+   /* Allocate AHB */
    AHardwareBuffer_Desc desc = {
       .width = W,
       .height = H,
       .layers = 1,
       .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
-      .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+      .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY,
    };
    AHardwareBuffer *ahb = NULL;
    if (AHardwareBuffer_allocate(&desc, &ahb) != 0 || !ahb) {
@@ -193,17 +193,17 @@ int main(int argc, char **argv)
    }
    AHardwareBuffer_Desc out_desc;
    AHardwareBuffer_describe(ahb, &out_desc);
-   printf("G-AHB allocated (stride=%u)\n", out_desc.stride);
+   printf("G-AHB allocated stride=%u\n", out_desc.stride);
 
-   /* 2. Query properties */
+   /* Query AHB properties */
    VkAndroidHardwareBufferPropertiesANDROID ahb_props = {
       .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
    };
    CK(vkGetAndroidHardwareBufferPropertiesANDROID(dev, ahb, &ahb_props), "AHBProps");
-   printf("G-AHB props queried (size=%llu memTypeBits=0x%x)\n",
+   printf("G-AHB allocSize=%llu memTypeBits=0x%x\n",
           (unsigned long long)ahb_props.allocationSize, ahb_props.memoryTypeBits);
 
-   /* 3. Create Image */
+   /* Create Image for AHB */
    VkExternalMemoryImageCreateInfo emici = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
       .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
@@ -225,7 +225,7 @@ int main(int argc, char **argv)
    VkImage img;
    CK(vkCreateImage(dev, &ici2, NULL, &img), "Image");
 
-   /* 4. Import Memory */
+   /* Import AHB into VkDeviceMemory */
    VkImportAndroidHardwareBufferInfoANDROID imp = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
       .buffer = ahb,
@@ -250,9 +250,9 @@ int main(int argc, char **argv)
    };
    VkDeviceMemory imem;
    CK(vkAllocateMemory(dev, &mai, NULL, &imem), "AllocMemory(import)");
-   printf("G-memory imported\n");
+   printf("G-import OK\n");
 
-   /* 5. Bind Image */
+   /* Bind image memory */
    VkBindImageMemoryInfo bmi = {
       .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
       .image = img,
@@ -260,9 +260,8 @@ int main(int argc, char **argv)
       .memoryOffset = 0,
    };
    CK(vkBindImageMemory2(dev, 1, &bmi), "BindImageMemory2");
-   printf("G-image bound\n");
 
-   /* 6. GPU write (render red triangle on blue clear) */
+   /* Create ImageView */
    VkImageViewCreateInfo ivci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = img,
@@ -273,6 +272,7 @@ int main(int argc, char **argv)
    VkImageView view;
    CK(vkCreateImageView(dev, &ivci, NULL, &view), "View");
 
+   /* Render Pass: clear to blue */
    VkAttachmentDescription att = {
       .format = VK_FORMAT_R8G8B8A8_UNORM,
       .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -299,6 +299,7 @@ int main(int argc, char **argv)
    VkFramebuffer fb;
    CK(vkCreateFramebuffer(dev, &fbci, NULL, &fb), "FB");
 
+   /* Vertex buffer for red triangle */
    float verts[] = {-1.0f, -1.0f, -0.25f, -1.0f, -1.0f, -0.25f};
    VkBufferCreateInfo vbci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sizeof(verts), .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
    VkBuffer vbuf;
@@ -323,6 +324,7 @@ int main(int argc, char **argv)
    memcpy(vp, verts, sizeof(verts));
    vkUnmapMemory(dev, vmem);
 
+   /* Shaders and Pipeline */
    VkShaderModuleCreateInfo vsmci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof(tri_vert_spv), .pCode = tri_vert_spv};
    VkShaderModule vsm;
    CK(vkCreateShaderModule(dev, &vsmci, NULL, &vsm), "VSM");
@@ -365,7 +367,9 @@ int main(int argc, char **argv)
    };
    VkPipeline pipe;
    CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe), "GfxPipe");
+   printf("G-pipeline ready\n");
 
+   /* Command buffer */
    VkCommandPoolCreateInfo cpoci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qi};
    VkCommandPool cpool;
    CK(vkCreateCommandPool(dev, &cpoci, NULL, &cpool), "Pool");
@@ -398,11 +402,11 @@ int main(int argc, char **argv)
    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
    CK(vkQueueSubmit(queue, 1, &si, fence), "Submit");
    CK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 30 * 1000 * 1000 * 1000ULL), "Wait");
-   printf("G-GPU write complete\n");
+   printf("G-submit complete\n");
 
-   /* 7. CPU readback verification */
+   /* CPU readback via AHB lock */
    void *data = NULL;
-   int32_t lock_r = AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &data);
+   int32_t lock_r = AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, NULL, &data);
    if (lock_r != 0 || !data) {
       printf("FAIL AHB lock r=%d\n", lock_r);
       return 1;
@@ -415,9 +419,8 @@ int main(int argc, char **argv)
    int ok = (in_px[0] > 200 && in_px[1] < 60 && in_px[2] < 60) &&
             (clear_px[2] > 200 && clear_px[0] < 60 && clear_px[1] < 60);
    AHardwareBuffer_unlock(ahb, NULL);
-
-   /* 8. Release cleanly */
    AHardwareBuffer_release(ahb);
+
    vkDestroyFence(dev, fence, NULL);
    vkFreeCommandBuffers(dev, cpool, 1, &cmd);
    vkDestroyCommandPool(dev, cpool, NULL);
@@ -434,12 +437,11 @@ int main(int argc, char **argv)
    vkDestroyBuffer(dev, vbuf, NULL);
    vkDestroyDevice(dev, NULL);
    vkDestroyInstance(inst, NULL);
-   printf("G-clean release complete\n");
 
    if (ok) {
       printf("G-PASS\n");
       return 0;
    }
-   printf("G-FAIL\n");
+   printf("G-FAIL (pixel check)\n");
    return 1;
 }
